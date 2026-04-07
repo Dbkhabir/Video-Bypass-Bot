@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import uuid
 import logging
 import tempfile
 import subprocess
@@ -49,6 +50,9 @@ HEADERS = {
     ),
 }
 
+http = requests.Session()
+http.headers.update(HEADERS)
+
 
 def is_supported_url(url: str) -> bool:
     try:
@@ -59,31 +63,71 @@ def is_supported_url(url: str) -> bool:
         return False
 
 
+SITE_INFO = {
+    "luluvdo": {"name": "Luluvdo", "url": "https://luluvdo.com"},
+    "vidara": {"name": "Vidara", "url": "https://vidara.so"},
+    "brainzaps": {"name": "Brainzaps", "url": "https://brainzaps.tv"},
+    "streamtape": {"name": "Streamtape", "url": "https://streamtape.com"},
+}
+
+
 def get_site_name(url: str) -> str:
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower().replace("www.", "")
-        for d in SUPPORTED_DOMAINS:
-            if d in domain:
-                return d.split(".")[0].capitalize()
+        for key, info in SITE_INFO.items():
+            if key in domain:
+                return info["name"]
         return "Unknown"
     except Exception:
         return "Unknown"
+
+
+def get_site_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().replace("www.", "")
+        for key, info in SITE_INFO.items():
+            if key in domain:
+                return info["url"]
+        return ""
+    except Exception:
+        return ""
+
+
+def clean_title(raw: str, site_words: list[str]) -> str:
+    t = raw.strip()
+    t = re.sub(r"\s*(at\s+)?\S*\.(com|net|org|to|so|tv|io|cc|me)\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\.(mp4|mkv|avi|mov|webm|flv|wmv|ts)", "", t, flags=re.IGNORECASE)
+    for w in site_words:
+        t = re.sub(r"(?i)\b" + re.escape(w) + r"\b", "", t)
+    t = re.sub(r"\s*[-–|:]\s*$", "", t.strip())
+    t = re.sub(r"^\s*[-–|:]\s*", "", t.strip())
+    t = re.sub(r"\s*[-–|:]\s*$", "", t.strip())
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"[_]+", " ", t)
+    return t.strip() if t.strip() else ""
 
 
 def extract_streamtape(url: str) -> dict:
     result = {"direct_url": None, "title": "Streamtape Video", "error": None}
     try:
         url = url.replace("/e/", "/v/")
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = http.get(url, timeout=15)
         resp.raise_for_status()
         html = resp.text
 
-        title_match = re.search(r"<title>([^<]+)</title>", html)
-        if title_match:
-            t = title_match.group(1).strip()
-            if t and "streamtape" not in t.lower():
-                result["title"] = t
+        for pattern in [
+            r'<meta\s+property="og:title"\s+content="([^"]+)"',
+            r'<meta\s+name="title"\s+content="([^"]+)"',
+            r"<title>([^<]+)</title>",
+        ]:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                t = clean_title(m.group(1), ["streamtape", "video not found"])
+                if t and len(t) > 2:
+                    result["title"] = t
+                    break
 
         js_match = re.search(
             r"document\.getElementById\('norobotlink'\)\.innerHTML\s*=\s*'([^']+)'\s*\+\s*\('([^']+)'\)\.substring\((\d+)\)\.substring\((\d+)\)",
@@ -108,19 +152,24 @@ def extract_luluvdo(url: str) -> dict:
     try:
         video_id = url.rstrip("/").split("/")[-1]
         embed_url = f"https://luluvdo.com/e/{video_id}"
-        resp = requests.get(
+        resp = http.get(
             embed_url,
-            headers={**HEADERS, "Referer": "https://luluvdo.com/"},
+            headers={"Referer": "https://luluvdo.com/"},
             timeout=15,
         )
         resp.raise_for_status()
         html = resp.text
 
-        title_match = re.search(r"<title>([^<]+)</title>", html)
-        if title_match:
-            t = title_match.group(1).strip().replace(" - LuluStream", "")
-            if t:
-                result["title"] = t
+        for pattern in [
+            r'<meta\s+property="og:title"\s+content="([^"]+)"',
+            r"<title>([^<]+)</title>",
+        ]:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                t = clean_title(m.group(1), ["lulustream", "luluvdo", ".mp4", ".mkv"])
+                if t and len(t) > 2:
+                    result["title"] = t
+                    break
 
         m3u8 = re.findall(r"(https?://[^\s\"'<>]+\.m3u8[^\s\"'<>]*)", html)
         if m3u8:
@@ -135,19 +184,21 @@ def extract_luluvdo(url: str) -> dict:
 def extract_brainzaps(url: str) -> dict:
     result = {"direct_url": None, "title": "Brainzaps Video", "error": None}
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = http.get(url, timeout=15)
         resp.raise_for_status()
         html = resp.text
 
-        title_match = re.search(r"<h2[^>]*>([^<]+)</h2>", html)
-        if not title_match:
-            title_match = re.search(r"<title>([^<]+)</title>", html)
-        if title_match:
-            t = title_match.group(1).strip()
-            for remove in ["Watch ", " online", " - Brainzaps"]:
-                t = t.replace(remove, "")
-            if t:
-                result["title"] = t
+        for pattern in [
+            r'<meta\s+property="og:title"\s+content="([^"]+)"',
+            r"<h[1-6][^>]*>([^<]{3,})</h[1-6]>",
+            r"<title>([^<]+)</title>",
+        ]:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                t = clean_title(m.group(1), ["brainzaps", "brainzaps.tv", "watch ", " online"])
+                if t and len(t) > 2:
+                    result["title"] = t
+                    break
 
         eval_match = re.search(
             r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'([^']*)'",
@@ -190,10 +241,9 @@ def extract_vidara(url: str) -> dict:
     result = {"direct_url": None, "title": "Vidara Video", "error": None}
     try:
         video_id = url.rstrip("/").split("/")[-1]
-        resp = requests.post(
+        resp = http.post(
             "https://vidara.so/api/stream",
             headers={
-                **HEADERS,
                 "Content-Type": "application/json",
                 "Referer": f"https://vidara.so/e/{video_id}",
                 "Origin": "https://vidara.so",
@@ -204,7 +254,10 @@ def extract_vidara(url: str) -> dict:
         if resp.status_code == 200:
             data = resp.json()
             result["direct_url"] = data.get("streaming_url")
-            result["title"] = data.get("title", "Vidara Video")
+            raw_title = data.get("title", "")
+            if raw_title:
+                t = clean_title(raw_title, ["vidara", ".mp4", ".mkv"])
+                result["title"] = t if t else "Vidara Video"
         else:
             result["error"] = f"API returned status {resp.status_code}"
     except Exception as e:
@@ -234,7 +287,7 @@ EXTRACTORS = {
 
 
 def download_video(direct_url: str, site: str, original_url: str = "") -> str | None:
-    tmp_path = os.path.join(tempfile.gettempdir(), f"tgbot_{int(time.time())}.mp4")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"tgbot_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp4")
 
     if site == "luluvdo" and original_url:
         try:
@@ -263,16 +316,16 @@ def download_video(direct_url: str, site: str, original_url: str = "") -> str | 
 
     if site == "streamtape":
         try:
-            resp = requests.get(
+            resp = http.get(
                 direct_url,
-                headers={**HEADERS, "Referer": "https://streamtape.com/"},
+                headers={"Referer": "https://streamtape.com/"},
                 stream=True,
                 timeout=120,
                 allow_redirects=True,
             )
             resp.raise_for_status()
             with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=65536):
+                for chunk in resp.iter_content(chunk_size=1048576):
                     f.write(chunk)
             if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
                 return tmp_path
@@ -519,35 +572,12 @@ def on_task_done(task_id: int, client: Client):
     asyncio.ensure_future(process_queue(client))
 
 
-@app.on_message(filters.text & filters.private)
-async def handle_message(client: Client, message: Message):
-    text = message.text.strip()
-
-    if text.startswith("/"):
-        return
-
-    url_match = re.search(r"https?://[^\s]+", text)
-    if not url_match:
-        await message.reply_text(
-            "⛔ Please send a valid URL from a supported site."
-        )
-        return
-
-    url = url_match.group(0)
-
-    if not is_supported_url(url):
-        await message.reply_text(
-            "⛔ **Unsupported site!**\n\n"
-            "🌐 **Supported:**\n"
-            "├ Luluvdo\n├ Vidara\n├ Brainzaps\n└ Streamtape",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
+async def enqueue_url(client: Client, chat_id: int, task_id: int, url: str):
     site_name = get_site_name(url)
 
     if len(active_tasks) >= MAX_CONCURRENT:
-        status_msg = await message.reply_text(
+        status_msg = await client.send_message(
+            chat_id,
             f"🕐 **In Queue — {site_name}**\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📍 Position: **#{len(task_queue) + 1}** in queue\n"
@@ -555,10 +585,11 @@ async def handle_message(client: Client, message: Message):
             f"💬 Your video will start processing soon!",
             parse_mode=ParseMode.MARKDOWN,
         )
-        task_queue.append((message.chat.id, message.id, url, status_msg))
+        task_queue.append((chat_id, task_id, url, status_msg))
         return
 
-    status_msg = await message.reply_text(
+    status_msg = await client.send_message(
+        chat_id,
         f"⚡ **Processing — {site_name}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🔄 Analyzing page...\n"
@@ -568,9 +599,52 @@ async def handle_message(client: Client, message: Message):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    task = asyncio.create_task(process_video(client, message.chat.id, message.id, url, status_msg))
-    active_tasks[message.id] = task
-    task.add_done_callback(lambda t, tid=message.id: on_task_done(tid, client))
+    task = asyncio.create_task(process_video(client, chat_id, task_id, url, status_msg))
+    active_tasks[task_id] = task
+    task.add_done_callback(lambda t, tid=task_id: on_task_done(tid, client))
+
+
+@app.on_message(filters.text & filters.private)
+async def handle_message(client: Client, message: Message):
+    text = message.text.strip()
+
+    if text.startswith("/"):
+        return
+
+    all_urls = re.findall(r"https?://[^\s]+", text)
+    if not all_urls:
+        await message.reply_text(
+            "⛔ Please send a valid URL from a supported site."
+        )
+        return
+
+    supported = [u for u in all_urls if is_supported_url(u)]
+    unsupported = [u for u in all_urls if not is_supported_url(u)]
+
+    if not supported:
+        await message.reply_text(
+            "⛔ **Unsupported site!**\n\n"
+            "🌐 **Supported:**\n"
+            "├ Luluvdo\n├ Vidara\n├ Brainzaps\n└ Streamtape",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if len(supported) > 1:
+        sites = ", ".join(get_site_name(u) for u in supported)
+        msg = (
+            f"📋 **{len(supported)} links detected**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🌐 Sites: {sites}\n"
+            f"⚡ Processing all of them..."
+        )
+        if unsupported:
+            msg += f"\n⚠️ {len(unsupported)} unsupported link(s) skipped."
+        await message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    for i, url in enumerate(supported):
+        task_id = message.id * 1000 + i
+        await enqueue_url(client, message.chat.id, task_id, url)
 
 
 async def process_video(client: Client, chat_id: int, msg_id: int, url: str, status_msg):
@@ -749,11 +823,14 @@ async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: s
     resolution = format_resolution(meta["width"], meta["height"])
     duration = format_duration(meta["duration"])
     total_time = time.time() - process_start
+    site_home = get_site_url(url)
+
+    source_line = f"🌐 Source: [{site_name}]({site_home})" if site_home else f"🌐 Source: {site_name}"
 
     caption = (
         f"🎬 **{title}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🌐 Source: {site_name}\n"
+        f"{source_line}\n"
         f"🖥️ Quality: {resolution}\n"
         f"⏱️ Duration: {duration}\n"
         f"📦 Size: {format_size(file_size)}\n"
@@ -798,13 +875,37 @@ async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: s
                 pass
 
 
+async def cleanup_temp_files():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            tmp_dir = tempfile.gettempdir()
+            now = time.time()
+            for f in os.listdir(tmp_dir):
+                if f.startswith("tgbot_") and (f.endswith(".mp4") or f.endswith(".jpg")):
+                    fp = os.path.join(tmp_dir, f)
+                    if os.path.isfile(fp) and (now - os.path.getmtime(fp)) > 600:
+                        os.remove(fp)
+                        logger.info(f"Cleaned up temp file: {f}")
+        except Exception as e:
+            logger.warning(f"Cleanup error: {e}")
+
+
 def main():
     if not BOT_TOKEN or not API_ID or not API_HASH:
         logger.error("Missing TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID, or TELEGRAM_API_HASH!")
         return
 
     logger.info("Bot starting with Pyrogram (MTProto) - 2GB upload support!")
-    app.run()
+
+    async def run():
+        async with app:
+            logger.info("Bot connected! Starting cleanup task.")
+            asyncio.ensure_future(cleanup_temp_files())
+            from pyrogram import idle
+            await idle()
+
+    app.run(run())
 
 
 if __name__ == "__main__":
