@@ -7,6 +7,7 @@ import tempfile
 import subprocess
 import asyncio
 import requests
+import json
 from urllib.parse import urlparse
 from collections import deque
 
@@ -28,6 +29,33 @@ MAX_CONCURRENT = 3
 active_tasks: dict[int, asyncio.Task] = {}
 task_queue: deque = deque()
 queue_lock = asyncio.Lock()
+cancelled_tasks: set[int] = set()
+
+
+def make_progress_bar(percent: float, length: int = 12) -> str:
+    filled = int(length * percent / 100)
+    bar = "█" * filled + "░" * (length - filled)
+    return bar
+
+
+def format_speed(bytes_per_sec: float) -> str:
+    if bytes_per_sec <= 0:
+        return "0 B/s"
+    if bytes_per_sec < 1024:
+        return f"{bytes_per_sec:.0f} B/s"
+    if bytes_per_sec < 1024 * 1024:
+        return f"{bytes_per_sec / 1024:.1f} KB/s"
+    return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
+
+
+def format_eta(seconds: float) -> str:
+    if seconds <= 0 or seconds > 86400:
+        return "..."
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    m = int(seconds) // 60
+    s = int(seconds) % 60
+    return f"{m}m {s}s"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
@@ -54,6 +82,28 @@ http = requests.Session()
 http.headers.update(HEADERS)
 
 
+def retry_request(func, max_retries=3, delay=1):
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            result = func()
+            return result
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last_error = e
+            logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+    raise last_error
+
+
+def fresh_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
 def is_supported_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -69,6 +119,8 @@ SITE_INFO = {
     "brainzaps": {"name": "Brainzaps", "url": "https://brainzaps.tv"},
     "streamtape": {"name": "Streamtape", "url": "https://streamtape.com"},
 }
+
+active_chat_tasks: dict[int, set[int]] = {}
 
 
 def get_site_name(url: str) -> str:
@@ -111,157 +163,261 @@ def clean_title(raw: str, site_words: list[str]) -> str:
 
 def extract_streamtape(url: str) -> dict:
     result = {"direct_url": None, "title": "Streamtape Video", "error": None}
-    try:
-        url = url.replace("/e/", "/v/")
-        resp = http.get(url, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
+    url = url.replace("/e/", "/v/")
 
-        for pattern in [
-            r'<meta\s+property="og:title"\s+content="([^"]+)"',
-            r'<meta\s+name="title"\s+content="([^"]+)"',
-            r"<title>([^<]+)</title>",
-        ]:
-            m = re.search(pattern, html, re.IGNORECASE)
-            if m:
-                t = clean_title(m.group(1), ["streamtape", "video not found"])
-                if t and len(t) > 2:
-                    result["title"] = t
-                    break
+    for attempt in range(3):
+        try:
+            s = fresh_session()
+            resp = s.get(url, timeout=15)
+            resp.raise_for_status()
+            html = resp.text
 
-        js_match = re.search(
-            r"document\.getElementById\('norobotlink'\)\.innerHTML\s*=\s*'([^']+)'\s*\+\s*\('([^']+)'\)\.substring\((\d+)\)\.substring\((\d+)\)",
-            html,
-        )
-        if js_match:
-            part1 = js_match.group(1)
-            part2 = js_match.group(2)
-            sub1 = int(js_match.group(3))
-            sub2 = int(js_match.group(4))
-            token_part = part2[sub1:][sub2:]
-            result["direct_url"] = "https:" + part1 + token_part
-        else:
-            result["error"] = "Could not find video token in page"
-    except Exception as e:
-        result["error"] = str(e)
+            for pattern in [
+                r'<meta\s+property="og:title"\s+content="([^"]+)"',
+                r'<meta\s+name="title"\s+content="([^"]+)"',
+                r"<title>([^<]+)</title>",
+            ]:
+                m = re.search(pattern, html, re.IGNORECASE)
+                if m:
+                    t = clean_title(m.group(1), ["streamtape", "video not found"])
+                    if t and len(t) > 2:
+                        result["title"] = t
+                        break
+
+            js_match = re.search(
+                r"document\.getElementById\('norobotlink'\)\.innerHTML\s*=\s*'([^']+)'\s*\+\s*\('([^']+)'\)\.substring\((\d+)\)\.substring\((\d+)\)",
+                html,
+            )
+            if js_match:
+                part1 = js_match.group(1)
+                part2 = js_match.group(2)
+                sub1 = int(js_match.group(3))
+                sub2 = int(js_match.group(4))
+                token_part = part2[sub1:][sub2:]
+                result["direct_url"] = "https:" + part1 + token_part
+                return result
+            else:
+                result["error"] = "Could not find video token in page"
+                if attempt < 2:
+                    logger.warning(f"Streamtape extract failed (attempt {attempt + 1}), retrying...")
+                    time.sleep(1)
+                    continue
+        except Exception as e:
+            result["error"] = str(e)
+            if attempt < 2:
+                logger.warning(f"Streamtape error (attempt {attempt + 1}): {e}")
+                time.sleep(1)
+                continue
     return result
+
+
+def get_m3u8_duration(master_url: str, referer: str = "") -> float:
+    try:
+        s = fresh_session()
+        hdrs = {"Referer": referer} if referer else {}
+        r = s.get(master_url, headers=hdrs, timeout=10)
+        if r.status_code != 200:
+            return 0
+        base_url = master_url.rsplit("/", 1)[0] + "/"
+        index_url = None
+        for line in r.text.strip().split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("http"):
+                index_url = line
+            else:
+                index_url = base_url + line
+            break
+
+        def parse_extinf(text):
+            total = 0
+            for l in text.split("\n"):
+                if l.startswith("#EXTINF:"):
+                    try:
+                        total += float(l.split(":")[1].split(",")[0])
+                    except Exception:
+                        pass
+            return total
+
+        if not index_url:
+            return parse_extinf(r.text)
+
+        r2 = s.get(index_url, headers=hdrs, timeout=10)
+        if r2.status_code != 200:
+            return 0
+        return parse_extinf(r2.text)
+    except Exception:
+        return 0
 
 
 def extract_luluvdo(url: str) -> dict:
     result = {"direct_url": None, "title": "Luluvdo Video", "error": None}
-    try:
-        video_id = url.rstrip("/").split("/")[-1]
-        embed_url = f"https://luluvdo.com/e/{video_id}"
-        resp = http.get(
-            embed_url,
-            headers={"Referer": "https://luluvdo.com/"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        html = resp.text
+    video_id = url.rstrip("/").split("/")[-1]
+    embed_url = f"https://luluvdo.com/e/{video_id}"
 
-        for pattern in [
-            r'<meta\s+property="og:title"\s+content="([^"]+)"',
-            r"<title>([^<]+)</title>",
-        ]:
-            m = re.search(pattern, html, re.IGNORECASE)
-            if m:
-                t = clean_title(m.group(1), ["lulustream", "luluvdo", ".mp4", ".mkv"])
-                if t and len(t) > 2:
-                    result["title"] = t
-                    break
+    for attempt in range(3):
+        try:
+            s = fresh_session()
+            resp = s.get(
+                embed_url,
+                headers={"Referer": "https://luluvdo.com/"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            html = resp.text
 
-        m3u8 = re.findall(r"(https?://[^\s\"'<>]+\.m3u8[^\s\"'<>]*)", html)
-        if m3u8:
-            result["direct_url"] = m3u8[0]
-        else:
-            result["error"] = "No m3u8 URL found in embed page"
-    except Exception as e:
-        result["error"] = str(e)
+            for pattern in [
+                r'<meta\s+property="og:title"\s+content="([^"]+)"',
+                r"<title>([^<]+)</title>",
+            ]:
+                m = re.search(pattern, html, re.IGNORECASE)
+                if m:
+                    t = clean_title(m.group(1), ["lulustream", "luluvdo", ".mp4", ".mkv"])
+                    if t and len(t) > 2:
+                        result["title"] = t
+                        break
+
+            m3u8 = re.findall(r"(https?://[^\s\"'<>]+\.m3u8[^\s\"'<>]*)", html)
+            if m3u8:
+                result["direct_url"] = m3u8[0]
+                result["hls_duration"] = get_m3u8_duration(m3u8[0], "https://luluvdo.com/")
+                return result
+            else:
+                result["error"] = "No m3u8 URL found in embed page"
+                if attempt < 2:
+                    logger.warning(f"Luluvdo extract failed (attempt {attempt + 1}), retrying...")
+                    time.sleep(1)
+                    continue
+        except Exception as e:
+            result["error"] = str(e)
+            if attempt < 2:
+                logger.warning(f"Luluvdo error (attempt {attempt + 1}): {e}")
+                time.sleep(1)
+                continue
     return result
 
 
 def extract_brainzaps(url: str) -> dict:
     result = {"direct_url": None, "title": "Brainzaps Video", "error": None}
-    try:
-        resp = http.get(url, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
 
-        for pattern in [
-            r'<meta\s+property="og:title"\s+content="([^"]+)"',
-            r"<h[1-6][^>]*>([^<]{3,})</h[1-6]>",
-            r"<title>([^<]+)</title>",
-        ]:
-            m = re.search(pattern, html, re.IGNORECASE)
-            if m:
-                t = clean_title(m.group(1), ["brainzaps", "brainzaps.tv", "watch ", " online"])
-                if t and len(t) > 2:
-                    result["title"] = t
-                    break
+    for attempt in range(3):
+        try:
+            s = fresh_session()
+            resp = s.get(url, timeout=15)
+            resp.raise_for_status()
+            html = resp.text
 
-        eval_match = re.search(
-            r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'([^']*)'",
-            html,
-            re.DOTALL,
-        )
-        if not eval_match:
-            result["error"] = "No packed JS found"
-            return result
+            for pattern in [
+                r'<meta\s+property="og:title"\s+content="([^"]+)"',
+                r"<h[1-6][^>]*>([^<]{3,})</h[1-6]>",
+                r"<title>([^<]+)</title>",
+            ]:
+                m = re.search(pattern, html, re.IGNORECASE)
+                if m:
+                    t = clean_title(m.group(1), ["brainzaps", "brainzaps.tv", "watch ", " online"])
+                    if t and len(t) > 2:
+                        result["title"] = t
+                        break
 
-        encoded_str = eval_match.group(1)
-        a = int(eval_match.group(2))
-        c = int(eval_match.group(3))
-        keywords = eval_match.group(4).split("|")
+            eval_match = re.search(
+                r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'([^']*)'",
+                html,
+                re.DOTALL,
+            )
+            if not eval_match:
+                result["error"] = "No packed JS found"
+                if attempt < 2:
+                    logger.warning(f"Brainzaps extract failed (attempt {attempt + 1}), retrying...")
+                    time.sleep(1)
+                    continue
+                return result
 
-        def base_convert(num, base):
-            chars = "0123456789abcdefghijklmnopqrstuvwxyz"
-            if num < base:
-                return chars[num]
-            return base_convert(num // base, base) + chars[num % base]
+            encoded_str = eval_match.group(1)
+            a = int(eval_match.group(2))
+            c = int(eval_match.group(3))
+            keywords = eval_match.group(4).split("|")
 
-        decoded = encoded_str
-        while c > 0:
-            c -= 1
-            if keywords[c]:
-                pattern = r"\b" + base_convert(c, a) + r"\b"
-                decoded = re.sub(pattern, keywords[c], decoded)
+            def base_convert(num, base):
+                chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+                if num < base:
+                    return chars[num]
+                return base_convert(num // base, base) + chars[num % base]
 
-        m3u8 = re.findall(r"(https?://[^\s\"'<>]+\.m3u8[^\s\"'<>]*)", decoded)
-        if m3u8:
-            result["direct_url"] = m3u8[0]
-        else:
-            result["error"] = "No m3u8 URL found in decoded JS"
-    except Exception as e:
-        result["error"] = str(e)
+            decoded = encoded_str
+            while c > 0:
+                c -= 1
+                if keywords[c]:
+                    pat = r"\b" + base_convert(c, a) + r"\b"
+                    decoded = re.sub(pat, keywords[c], decoded)
+
+            m3u8 = re.findall(r"(https?://[^\s\"'<>]+\.m3u8[^\s\"'<>]*)", decoded)
+            if m3u8:
+                result["direct_url"] = m3u8[0]
+                result["hls_duration"] = get_m3u8_duration(m3u8[0], url)
+                return result
+            else:
+                result["error"] = "No m3u8 URL found in decoded JS"
+                if attempt < 2:
+                    logger.warning(f"Brainzaps m3u8 not found (attempt {attempt + 1}), retrying...")
+                    time.sleep(1)
+                    continue
+        except Exception as e:
+            result["error"] = str(e)
+            if attempt < 2:
+                logger.warning(f"Brainzaps error (attempt {attempt + 1}): {e}")
+                time.sleep(1)
+                continue
     return result
 
 
 def extract_vidara(url: str) -> dict:
     result = {"direct_url": None, "title": "Vidara Video", "error": None}
-    try:
-        video_id = url.rstrip("/").split("/")[-1]
-        resp = http.post(
-            "https://vidara.so/api/stream",
-            headers={
-                "Content-Type": "application/json",
-                "Referer": f"https://vidara.so/e/{video_id}",
-                "Origin": "https://vidara.so",
-            },
-            json={"filecode": video_id, "device": "web"},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            result["direct_url"] = data.get("streaming_url")
-            raw_title = data.get("title", "")
-            if raw_title:
-                t = clean_title(raw_title, ["vidara", ".mp4", ".mkv"])
-                result["title"] = t if t else "Vidara Video"
-        else:
-            result["error"] = f"API returned status {resp.status_code}"
-    except Exception as e:
-        result["error"] = str(e)
+    video_id = url.rstrip("/").split("/")[-1]
+
+    for attempt in range(3):
+        try:
+            s = fresh_session()
+            resp = s.post(
+                "https://vidara.so/api/stream",
+                headers={
+                    "Content-Type": "application/json",
+                    "Referer": f"https://vidara.so/e/{video_id}",
+                    "Origin": "https://vidara.so",
+                },
+                json={"filecode": video_id, "device": "web"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                stream_url = data.get("streaming_url")
+                if stream_url:
+                    result["direct_url"] = stream_url
+                    raw_title = data.get("title", "")
+                    if raw_title:
+                        t = clean_title(raw_title, ["vidara", ".mp4", ".mkv"])
+                        result["title"] = t if t else "Vidara Video"
+                    if ".m3u8" in stream_url:
+                        result["hls_duration"] = get_m3u8_duration(stream_url, f"https://vidara.so/e/{video_id}")
+                    return result
+                else:
+                    result["error"] = "No streaming URL in API response"
+                    if attempt < 2:
+                        logger.warning(f"Vidara no stream URL (attempt {attempt + 1}), retrying...")
+                        time.sleep(1)
+                        continue
+            else:
+                result["error"] = f"API returned status {resp.status_code}"
+                if attempt < 2:
+                    logger.warning(f"Vidara API status {resp.status_code} (attempt {attempt + 1}), retrying...")
+                    time.sleep(1)
+                    continue
+        except Exception as e:
+            result["error"] = str(e)
+            if attempt < 2:
+                logger.warning(f"Vidara error (attempt {attempt + 1}): {e}")
+                time.sleep(1)
+                continue
     return result
 
 
@@ -286,134 +442,255 @@ EXTRACTORS = {
 }
 
 
-def download_video(direct_url: str, site: str, original_url: str = "") -> str | None:
+def graceful_kill(proc, timeout=10):
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+
+def download_video(direct_url: str, site: str, original_url: str = "", progress: dict | None = None, task_id: int = 0, hls_duration: float = 0) -> str | None:
     tmp_path = os.path.join(tempfile.gettempdir(), f"tgbot_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp4")
+    FFMPEG_TIMEOUT = 600
 
-    if site == "luluvdo" and original_url:
-        try:
-            import yt_dlp
-            video_id = original_url.rstrip("/").split("/")[-1]
-            page_url = f"https://luluvdo.com/e/{video_id}"
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "format": "best[ext=mp4]/best",
-                "outtmpl": tmp_path,
-                "merge_output_format": "mp4",
-                "socket_timeout": 30,
-                "nocheckcertificate": True,
-                "geo_bypass": True,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([page_url])
-            if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                return tmp_path
-            alt_path = tmp_path.rsplit(".", 1)[0] + ".mp4"
-            if os.path.exists(alt_path) and os.path.getsize(alt_path) > 0:
-                return alt_path
-        except Exception as e:
-            logger.warning(f"yt-dlp direct download failed for luluvdo, falling back to ffmpeg: {e}")
+    def update_progress(downloaded, total, start_time):
+        if progress is None:
+            return
+        elapsed = time.time() - start_time
+        speed = downloaded / elapsed if elapsed > 0 else 0
+        eta = (total - downloaded) / speed if speed > 0 and total > 0 else 0
+        percent = (downloaded / total * 100) if total > 0 else 0
+        progress.update({
+            "downloaded": downloaded,
+            "total": total,
+            "speed": speed,
+            "eta": eta,
+            "percent": percent,
+            "updated": time.time(),
+        })
 
-    if site == "streamtape":
+    def is_cancelled():
+        return task_id in cancelled_tasks
+
+    def cleanup(path):
         try:
-            resp = http.get(
-                direct_url,
-                headers={"Referer": "https://streamtape.com/"},
-                stream=True,
-                timeout=120,
-                allow_redirects=True,
-            )
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1048576):
-                    f.write(chunk)
-            if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                return tmp_path
-        except Exception as e:
-            logger.error(f"Streamtape download error: {e}")
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    MIN_VIDEO_SIZE = 100000
+
+    def check_result(path):
+        if os.path.exists(path) and os.path.getsize(path) > MIN_VIDEO_SIZE:
+            logger.info(f"Download success: {os.path.getsize(path)} bytes at {path}")
+            return path
+        alt = path.rsplit(".", 1)[0] + ".mp4"
+        if os.path.exists(alt) and os.path.getsize(alt) > MIN_VIDEO_SIZE:
+            logger.info(f"Download success (alt path): {os.path.getsize(alt)} bytes")
+            return alt
         return None
 
     referer_map = {
         "luluvdo": "https://luluvdo.com/",
         "brainzaps": "https://brainzaps.tv/",
         "vidara": "https://vidara.so/",
+        "streamtape": "https://streamtape.com/",
     }
     origin_map = {
         "luluvdo": "https://luluvdo.com",
         "brainzaps": "https://brainzaps.tv",
         "vidara": "https://vidara.so",
+        "streamtape": "https://streamtape.com",
     }
     referer = referer_map.get(site, "")
     origin = origin_map.get(site, "")
 
-    headers_str = f"User-Agent: {HEADERS['User-Agent']}\r\n"
-    if referer:
-        headers_str += f"Referer: {referer}\r\n"
-    if origin:
-        headers_str += f"Origin: {origin}\r\n"
+    if site == "streamtape":
+        logger.info(f"[{site}] HTTP stream download: {direct_url[:80]}")
+        try:
+            s = fresh_session()
+            resp = s.get(
+                direct_url,
+                headers={"Referer": referer},
+                stream=True,
+                timeout=120,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            total_size = int(resp.headers.get("content-length", 0))
+            downloaded = 0
+            dl_start = time.time()
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1048576):
+                    if is_cancelled():
+                        logger.info(f"Download cancelled for task {task_id}")
+                        cleanup(tmp_path)
+                        return None
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    update_progress(downloaded, total_size, dl_start)
+            result = check_result(tmp_path)
+            if result:
+                return result
+        except Exception as e:
+            logger.error(f"Streamtape download error: {e}")
+        cleanup(tmp_path)
+        return None
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-headers", headers_str,
-        "-i", direct_url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+faststart",
-        tmp_path,
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if proc.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-            return tmp_path
-        logger.warning(f"ffmpeg failed, trying yt-dlp fallback. stderr: {proc.stderr[-300:]}")
-    except Exception as e:
-        logger.warning(f"ffmpeg error, trying yt-dlp fallback: {e}")
+    is_m3u8 = ".m3u8" in direct_url
 
-    try:
-        import yt_dlp
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "best[ext=mp4]/best",
-            "outtmpl": tmp_path,
-            "merge_output_format": "mp4",
-            "socket_timeout": 30,
-            "nocheckcertificate": True,
-            "geo_bypass": True,
-            "http_headers": {**HEADERS, "Referer": referer, "Origin": origin},
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([direct_url])
-        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-            return tmp_path
-        alt_path = tmp_path.rsplit(".", 1)[0] + ".mp4"
-        if os.path.exists(alt_path) and os.path.getsize(alt_path) > 0:
-            return alt_path
-    except Exception as e:
-        logger.error(f"yt-dlp fallback also failed: {e}")
+    if is_m3u8 or site in ("luluvdo", "brainzaps", "vidara"):
+        logger.info(f"[{site}] ffmpeg download (m3u8={is_m3u8}): {direct_url[:100]}")
+        headers_str = f"User-Agent: {HEADERS['User-Agent']}\r\n"
+        if referer:
+            headers_str += f"Referer: {referer}\r\n"
+        if origin:
+            headers_str += f"Origin: {origin}\r\n"
+
+        if progress is not None:
+            progress.update({"downloaded": 0, "total": 0, "speed": 0, "eta": 0, "percent": 0, "ffmpeg": True, "updated": time.time()})
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-headers", headers_str,
+            "-i", direct_url,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            tmp_path,
+        ]
+        stderr_log = tmp_path + ".stderr"
+        stderr_f = None
+        try:
+            stderr_f = open(stderr_log, "w")
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_f)
+            ffmpeg_start = time.time()
+            last_size = 0
+            stall_start = None
+            STALL_LIMIT = 90
+            total_duration = hls_duration
+            locked_est_total = 0
+            ffmpeg_time_re = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+
+            def parse_ffmpeg_time():
+                try:
+                    stderr_f.flush()
+                    with open(stderr_log, "r") as sf:
+                        text = sf.read()
+                    cur_time = 0
+                    for tm in ffmpeg_time_re.finditer(text):
+                        t = int(tm.group(1)) * 3600 + int(tm.group(2)) * 60 + int(tm.group(3)) + int(tm.group(4)) / 100
+                        if t > cur_time:
+                            cur_time = t
+                    return cur_time
+                except Exception:
+                    return 0
+
+            while proc.poll() is None:
+                if is_cancelled():
+                    graceful_kill(proc)
+                    cleanup(tmp_path)
+                    return None
+                elapsed = time.time() - ffmpeg_start
+                if elapsed > FFMPEG_TIMEOUT:
+                    logger.warning(f"[{site}] ffmpeg timeout after {FFMPEG_TIMEOUT}s, graceful stop")
+                    graceful_kill(proc, timeout=30)
+                    break
+                cur_size = 0
+                if os.path.exists(tmp_path):
+                    cur_size = os.path.getsize(tmp_path)
+                    speed = cur_size / elapsed if elapsed > 0 else 0
+                    cur_time = parse_ffmpeg_time()
+                    est_total = 0
+                    pct = 0
+                    eta = 0
+                    if total_duration > 0 and cur_time > 0:
+                        pct = min(cur_time / total_duration * 100, 99.9)
+                        raw_est = int(cur_size / (cur_time / total_duration))
+                        if pct >= 25 and not locked_est_total:
+                            locked_est_total = raw_est
+                        est_total = locked_est_total if locked_est_total else raw_est
+                        remaining_time = (total_duration - cur_time) / (cur_time / elapsed) if cur_time > 0 else 0
+                        eta = max(0, remaining_time)
+                    if progress is not None:
+                        progress.update({
+                            "downloaded": cur_size,
+                            "total": est_total,
+                            "speed": speed,
+                            "percent": pct,
+                            "eta": eta,
+                            "ffmpeg": True,
+                            "updated": time.time(),
+                        })
+                if cur_size == last_size and cur_size > 0:
+                    if stall_start is None:
+                        stall_start = time.time()
+                    elif time.time() - stall_start > STALL_LIMIT:
+                        logger.warning(f"[{site}] ffmpeg stalled for {STALL_LIMIT}s (size={cur_size}), graceful stop")
+                        graceful_kill(proc, timeout=30)
+                        break
+                else:
+                    stall_start = None
+                    last_size = cur_size
+                time.sleep(2)
+
+            result = check_result(tmp_path)
+            if result:
+                return result
+            logger.warning(f"[{site}] ffmpeg finished but file invalid, rc={proc.returncode}")
+        except Exception as e:
+            logger.warning(f"[{site}] ffmpeg error: {e}")
+        finally:
+            if stderr_f:
+                try: stderr_f.close()
+                except: pass
+            try: os.remove(stderr_log)
+            except: pass
+
+        cleanup(tmp_path)
+    logger.error(f"[{site}] All download methods failed for: {direct_url[:80]}")
     return None
 
 
 def generate_thumbnail(filepath: str) -> str | None:
     thumb_path = filepath.rsplit(".", 1)[0] + "_thumb.jpg"
+    for ss in ["00:00:03", "00:00:01", "00:00:00"]:
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", ss,
+                "-i", filepath,
+                "-vframes", "1",
+                "-vf", "scale=320:-1",
+                "-q:v", "5",
+                thumb_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+                logger.info(f"Thumbnail generated at ss={ss}, size={os.path.getsize(thumb_path)}")
+                return thumb_path
+            logger.warning(f"Thumbnail at ss={ss} failed: rc={proc.returncode}, stderr={proc.stderr[-200:]}")
+        except Exception as e:
+            logger.warning(f"Thumbnail at ss={ss} error: {e}")
     try:
         cmd = [
-            "ffmpeg", "-y", "-i", filepath,
-            "-ss", "00:00:03",
-            "-vframes", "1",
-            "-vf", "scale=320:-1",
+            "ffmpeg", "-y",
+            "-i", filepath,
+            "-vf", "thumbnail,scale=320:-1",
+            "-frames:v", "1",
             "-q:v", "5",
             thumb_path,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if proc.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            logger.info(f"Thumbnail generated via thumbnail filter, size={os.path.getsize(thumb_path)}")
             return thumb_path
-        cmd[4] = "00:00:00"
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-            return thumb_path
+        logger.warning(f"Thumbnail filter failed: rc={proc.returncode}")
     except Exception as e:
-        logger.warning(f"Thumbnail generation failed: {e}")
+        logger.warning(f"Thumbnail filter error: {e}")
     return None
 
 
@@ -426,7 +703,6 @@ def get_video_metadata(filepath: str) -> dict:
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode == 0:
-            import json
             data = json.loads(proc.stdout)
             for s in data.get("streams", []):
                 if s.get("codec_type") == "video":
@@ -516,9 +792,47 @@ async def help_command(client: Client, message: Message):
         "⚙️ **Commands:**\n"
         "├ /start — Start the bot\n"
         "├ /help — Show this help\n"
-        "└ /queue — Check active tasks"
+        "├ /queue — Check active tasks\n"
+        "└ /cancel — Cancel all tasks"
     )
     await message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+
+@app.on_message(filters.command("cancel"))
+async def cancel_command(client: Client, message: Message):
+    chat_id = message.chat.id
+    chat_task_ids = active_chat_tasks.get(chat_id, set())
+    if chat_task_ids:
+        count = len(chat_task_ids)
+        for tid in list(chat_task_ids):
+            cancelled_tasks.add(tid)
+        new_queue = deque()
+        removed = 0
+        for item in task_queue:
+            if item[0] == chat_id:
+                removed += 1
+            else:
+                new_queue.append(item)
+        task_queue.clear()
+        task_queue.extend(new_queue)
+        await message.reply_text(
+            f"🛑 **Cancelling {count} active task(s)...**\n"
+            f"{'🗑️ Removed ' + str(removed) + ' queued task(s).' if removed else ''}\n\n"
+            f"⏳ Downloads will stop shortly.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await message.reply_text(
+            "✨ No active tasks to cancel!",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+@app.on_callback_query(filters.regex(r"^cancel_(\d+)$"))
+async def cancel_callback(client: Client, callback_query):
+    task_id = int(callback_query.data.split("_")[1])
+    cancelled_tasks.add(task_id)
+    await callback_query.answer("🛑 Cancelling task...", show_alert=True)
 
 
 @app.on_message(filters.command("queue"))
@@ -550,7 +864,8 @@ async def process_queue(client: Client):
             task = asyncio.create_task(process_video(client, chat_id, msg_id, url, status_msg))
             task_id = msg_id
             active_tasks[task_id] = task
-            task.add_done_callback(lambda t, tid=task_id: on_task_done(tid, client))
+            active_chat_tasks.setdefault(chat_id, set()).add(task_id)
+            task.add_done_callback(lambda t, tid=task_id, cid=chat_id: on_task_done(tid, cid, client))
         if task_queue:
             for i, (cid, mid, u, smsg) in enumerate(task_queue):
                 try:
@@ -567,8 +882,13 @@ async def process_queue(client: Client):
                     pass
 
 
-def on_task_done(task_id: int, client: Client):
+def on_task_done(task_id: int, chat_id: int, client: Client):
     active_tasks.pop(task_id, None)
+    cancelled_tasks.discard(task_id)
+    if chat_id in active_chat_tasks:
+        active_chat_tasks[chat_id].discard(task_id)
+        if not active_chat_tasks[chat_id]:
+            del active_chat_tasks[chat_id]
     asyncio.ensure_future(process_queue(client))
 
 
@@ -601,7 +921,8 @@ async def enqueue_url(client: Client, chat_id: int, task_id: int, url: str):
 
     task = asyncio.create_task(process_video(client, chat_id, task_id, url, status_msg))
     active_tasks[task_id] = task
-    task.add_done_callback(lambda t, tid=task_id: on_task_done(tid, client))
+    active_chat_tasks.setdefault(chat_id, set()).add(task_id)
+    task.add_done_callback(lambda t, tid=task_id, cid=chat_id: on_task_done(tid, cid, client))
 
 
 @app.on_message(filters.text & filters.private)
@@ -611,6 +932,7 @@ async def handle_message(client: Client, message: Message):
     if text.startswith("/"):
         return
 
+    text = re.sub(r"(https?://)", r" \1", text).strip()
     all_urls = re.findall(r"https?://[^\s]+", text)
     if not all_urls:
         await message.reply_text(
@@ -650,24 +972,55 @@ async def handle_message(client: Client, message: Message):
 async def process_video(client: Client, chat_id: int, msg_id: int, url: str, status_msg):
     try:
         await _process_video_inner(client, chat_id, msg_id, url, status_msg)
-    except Exception as e:
-        logger.error(f"Unhandled error processing {url}: {e}")
+    except asyncio.CancelledError:
+        cancelled_tasks.add(msg_id)
         try:
             await status_msg.edit_text(
-                f"⛔ **Unexpected Error**\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"💬 {str(e)[:200]}\n\n"
-                f"🔁 Please try again.",
+                "🛑 **Cancelled**\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "💬 Task was cancelled.",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
             pass
+    except Exception as e:
+        logger.error(f"Unhandled error processing {url}: {e}", exc_info=True)
+        if msg_id in cancelled_tasks:
+            try:
+                await status_msg.edit_text(
+                    "🛑 **Cancelled**\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "💬 Task was cancelled.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await status_msg.edit_text(
+                    f"⛔ **Unexpected Error**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"💬 {str(e)[:200]}\n\n"
+                    f"🔁 Please try again.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
 
 
 async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: str, status_msg):
     site = detect_site(url)
     site_name = get_site_name(url)
     process_start = time.time()
+
+    cancel_btn = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_{msg_id}")]]
+    )
+
+    if msg_id in cancelled_tasks:
+        cancelled_tasks.discard(msg_id)
+        await status_msg.edit_text("🛑 **Cancelled**", parse_mode=ParseMode.MARKDOWN)
+        return
 
     try:
         await status_msg.edit_text(
@@ -678,6 +1031,7 @@ async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: s
             f"⬜ Downloading video\n"
             f"⬜ Uploading to Telegram",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=cancel_btn,
         )
     except Exception:
         pass
@@ -702,11 +1056,40 @@ async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: s
             f"⬜ Downloading video\n"
             f"⬜ Uploading to Telegram",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=cancel_btn,
         )
     except Exception:
         pass
 
-    info = await loop.run_in_executor(None, extractor, url)
+    if msg_id in cancelled_tasks:
+        cancelled_tasks.discard(msg_id)
+        await status_msg.edit_text("🛑 **Cancelled**", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    extract_start = time.time()
+    logger.info(f"Starting extraction for {site_name}: {url}")
+    try:
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, extractor, url),
+            timeout=60,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Extraction timed out after 60s for {url}")
+        await status_msg.edit_text(
+            f"⛔ **Extraction Timeout**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🌐 Site: {site_name}\n"
+            f"💬 The site took too long to respond.\n\n"
+            f"🔁 Please try again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    logger.info(f"Extraction done for {site_name} in {time.time() - extract_start:.1f}s — success={bool(info.get('direct_url'))}")
+
+    if msg_id in cancelled_tasks:
+        cancelled_tasks.discard(msg_id)
+        await status_msg.edit_text("🛑 **Cancelled**", parse_mode=ParseMode.MARKDOWN)
+        return
 
     if not info.get("direct_url"):
         error_detail = info.get("error", "Could not extract video URL")
@@ -723,26 +1106,109 @@ async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: s
     direct_url = info["direct_url"]
     title = info.get("title", "Video") or "Video"
 
-    try:
-        await status_msg.edit_text(
-            f"⚡ **Processing — {site_name}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ Page analyzed\n"
-            f"✅ Direct link extracted\n"
-            f"🔄 Downloading video...\n"
-            f"⬜ Uploading to Telegram\n\n"
-            f"🎞️ __{title}__",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        pass
+    dl_progress = {}
+
+    async def update_dl_status():
+        last_update = 0
+        while True:
+            await asyncio.sleep(3)
+            if msg_id in cancelled_tasks:
+                return
+            if not dl_progress or time.time() - dl_progress.get("updated", 0) > 10:
+                continue
+            if time.time() - last_update < 3:
+                continue
+            try:
+                dl = dl_progress.get("downloaded", 0)
+                total = dl_progress.get("total", 0)
+                speed = dl_progress.get("speed", 0)
+                eta = dl_progress.get("eta", 0)
+                percent = dl_progress.get("percent", 0)
+                is_ffmpeg = dl_progress.get("ffmpeg", False)
+
+                if is_ffmpeg:
+                    if total > 0 and percent > 0:
+                        bar = make_progress_bar(percent)
+                        bar_line = f"`[{bar}]` {percent:.1f}%"
+                        size_line = f"📥 {format_size(dl)} / ~{format_size(total)}"
+                    else:
+                        bar_line = ""
+                        size_line = f"📥 {format_size(dl)}"
+                    speed_line = f"🚀 {format_speed(speed)}" if speed > 0 else ""
+                    eta_line = f"⏳ ETA: {format_eta(eta)}" if eta > 0 else ""
+                    lines = [
+                        f"⚡ **Downloading — {site_name}**",
+                        "━━━━━━━━━━━━━━━━━━━━━",
+                        "",
+                        "✅ Page analyzed",
+                        "✅ Direct link extracted",
+                        bar_line,
+                        size_line,
+                        speed_line,
+                        eta_line,
+                        "",
+                        f"🎞️ __{title}__",
+                    ]
+                else:
+                    bar = make_progress_bar(percent)
+                    bar_line = f"`[{bar}]` {percent:.1f}%" if total > 0 else ""
+                    size_line = f"📥 {format_size(dl)}" + (f" / {format_size(total)}" if total > 0 else "")
+                    speed_line = f"🚀 {format_speed(speed)}" if speed > 0 else ""
+                    eta_line = f"⏳ ETA: {format_eta(eta)}" if eta > 0 else ""
+                    lines = [
+                        f"⚡ **Downloading — {site_name}**",
+                        "━━━━━━━━━━━━━━━━━━━━━",
+                        "",
+                        "✅ Page analyzed",
+                        "✅ Direct link extracted",
+                        bar_line,
+                        size_line,
+                        speed_line,
+                        eta_line,
+                        "",
+                        f"🎞️ __{title}__",
+                    ]
+                text = "\n".join(l for l in lines if l is not None and l != "")
+                await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=cancel_btn)
+                last_update = time.time()
+            except Exception:
+                pass
+
+    progress_task = asyncio.create_task(update_dl_status())
 
     try:
         await client.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
     except Exception:
         pass
 
-    filepath = await loop.run_in_executor(None, download_video, direct_url, site, url)
+    dl_start = time.time()
+    logger.info(f"Starting download for {title} ({site_name})")
+    try:
+        filepath = await asyncio.wait_for(
+            loop.run_in_executor(None, download_video, direct_url, site, url, dl_progress, msg_id, info.get("hls_duration", 0)),
+            timeout=600,
+        )
+    except asyncio.TimeoutError:
+        filepath = None
+        logger.error(f"Download timed out after 600s for {url}")
+    logger.info(f"Download finished in {time.time() - dl_start:.1f}s — file={'yes' if filepath else 'no'}")
+
+    progress_task.cancel()
+
+    if msg_id in cancelled_tasks:
+        cancelled_tasks.discard(msg_id)
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+        await status_msg.edit_text(
+            "🛑 **Cancelled**\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "💬 Task was cancelled by user.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     if not filepath or not os.path.exists(filepath):
         keyboard = InlineKeyboardMarkup(
@@ -792,19 +1258,44 @@ async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: s
             pass
         return
 
-    try:
-        await status_msg.edit_text(
-            f"⚡ **Processing — {site_name}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ Page analyzed\n"
-            f"✅ Direct link extracted\n"
-            f"✅ Downloaded — {format_size(file_size)}\n"
-            f"🔄 Uploading to Telegram...\n\n"
-            f"🎞️ __{title}__",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        pass
+    upload_last_edit = {"time": 0}
+
+    async def upload_progress(current, total):
+        now = time.time()
+        if now - upload_last_edit["time"] < 3:
+            return
+        upload_last_edit["time"] = now
+        try:
+            percent = current / total * 100 if total > 0 else 0
+            bar = make_progress_bar(percent)
+            speed_val = 0
+            if upload_last_edit.get("prev_current") is not None and upload_last_edit.get("prev_time"):
+                dt = now - upload_last_edit["prev_time"]
+                if dt > 0:
+                    speed_val = (current - upload_last_edit["prev_current"]) / dt
+            upload_last_edit["prev_current"] = current
+            upload_last_edit["prev_time"] = now
+            speed_line = f"🚀 {format_speed(speed_val)}" if speed_val > 0 else ""
+
+            lines = [
+                f"⚡ **Uploading — {site_name}**",
+                "━━━━━━━━━━━━━━━━━━━━━",
+                "",
+                "✅ Page analyzed",
+                "✅ Direct link extracted",
+                "✅ Downloaded",
+                f"`[{bar}]` {percent:.1f}%",
+                f"📤 {format_size(current)} / {format_size(total)}",
+                speed_line,
+                "",
+                f"🎞️ __{title}__",
+            ]
+            await status_msg.edit_text(
+                "\n".join(l for l in lines if l),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
 
     try:
         await client.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
@@ -845,10 +1336,13 @@ async def _process_video_inner(client: Client, chat_id: int, msg_id: int, url: s
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard,
             supports_streaming=True,
-            width=meta["width"] or None,
-            height=meta["height"] or None,
-            duration=meta["duration"] or None,
+            progress=upload_progress,
         )
+        if meta["width"] and meta["height"]:
+            send_kwargs["width"] = meta["width"]
+            send_kwargs["height"] = meta["height"]
+        if meta["duration"]:
+            send_kwargs["duration"] = meta["duration"]
         if thumb_path:
             send_kwargs["thumb"] = thumb_path
 
@@ -882,7 +1376,7 @@ async def cleanup_temp_files():
             tmp_dir = tempfile.gettempdir()
             now = time.time()
             for f in os.listdir(tmp_dir):
-                if f.startswith("tgbot_") and (f.endswith(".mp4") or f.endswith(".jpg")):
+                if f.startswith("tgbot_") and (f.endswith(".mp4") or f.endswith(".jpg") or f.endswith(".ts") or f.endswith(".stderr")):
                     fp = os.path.join(tmp_dir, f)
                     if os.path.isfile(fp) and (now - os.path.getmtime(fp)) > 600:
                         os.remove(fp)
